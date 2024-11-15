@@ -6,13 +6,20 @@ use std::collections::HashMap;
 use std::vec::Vec;
 
 #[derive(PartialEq, Clone)]
-enum Tab {
+pub enum Tab {
     Params,
     Headers,
     Body,
     Authorization,
 }
-struct Mensajero {
+
+#[derive(PartialEq)]
+pub enum BodyScreen {
+    Request,
+    Response,
+}
+
+pub struct Mensajero {
     url: String,
     method: String,
     response: Option<String>,
@@ -23,6 +30,13 @@ struct Mensajero {
     dock_state: DockState<Tab>,
     authentication: Option<String>,
     params: Vec<(String, String, String)>,
+    body_screen: BodyScreen,
+}
+
+impl Default for BodyScreen {
+    fn default() -> Self {
+        BodyScreen::Request
+    }
 }
 
 impl Default for Mensajero {
@@ -31,17 +45,26 @@ impl Default for Mensajero {
 
         let dock_state = DockState::new(tabs);
 
+        // Configurar el cliente con límites más altos
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .pool_max_idle_per_host(0)
+            .http1_only()  // Use HTTP/1.1 which is more stable for large responses
+            .build()
+            .unwrap_or_else(|_| Client::new());
+
         Self {
             url: String::new(),
             method: "GET".to_string(),
             response: None,
             request_body: None,
-            client: Client::new(),
+            client,
             headers: HashMap::new(),
             status_code: String::new(),
             dock_state,
             authentication: None,
             params: vec![("".to_string(), "".to_string(), "".to_string()); 4],
+            body_screen: BodyScreen::default(),
         }
     }
 }
@@ -86,52 +109,68 @@ impl Mensajero {
     }
 
     fn send_request(&mut self) {
-        // Clona la URL y el método para usarlos en la solicitud
         let url = self.url.clone();
         let method = self.method.clone();
         let client = &self.client;
-
-        // Establece un cuerpo de solicitud vacío si no se ha proporcionado uno
         let body = self.request_body.clone().unwrap_or_default();
 
-        // Realiza la solicitud asíncrona
-        let response: Result<reqwest::Response, Error> =
-            tokio::runtime::Runtime::new().unwrap().block_on(async {
-                match method.as_str() {
-                    "GET" => client.get(&url).send().await.map_err(Error::from),
-                    "POST" => client
-                        .post(&url)
-                        .body(body)
-                        .send()
-                        .await
-                        .map_err(Error::from),
-                    "PUT" => client
-                        .put(&url)
-                        .body(body)
-                        .send()
-                        .await
-                        .map_err(Error::from),
-                    "DELETE" => client.delete(&url).send().await.map_err(Error::from),
-                    _ => Err(Error::msg("Método no válido")),
-                }
-            });
+        // Create a single runtime instance outside the response handling
+        let rt = tokio::runtime::Runtime::new().unwrap();
 
-        // Maneja la respuesta
+        let response: Result<reqwest::Response, Error> = rt.block_on(async {
+            let request = match method.as_str() {
+                "GET" => client.get(&url),
+                "POST" => client.post(&url).body(body),
+                "PUT" => client.put(&url).body(body),
+                "DELETE" => client.delete(&url),
+                _ => return Err(Error::msg("Método no válido")),
+            };
+
+            request
+                .header("Accept", "application/json")
+                .header("Content-Type", "application/json")
+                .send()
+                .await
+                .map_err(Error::from)
+        });
+
         match response {
             Ok(resp) => {
                 self.status_code = resp.status().to_string();
-                self.response = Some(
-                    tokio::runtime::Runtime::new()
-                        .unwrap()
-                        .block_on(resp.text())
-                        .unwrap_or_else(|_| {
-                            "Error al obtener el cuerpo de la respuesta".to_string()
-                        }),
-                );
+                
+                // Crear un nuevo runtime para la operación asíncrona
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                
+                // Obtener el cuerpo completo de la respuesta usando bytes()
+                let response_text = rt.block_on(async {
+                    match resp.bytes().await {
+                        Ok(bytes) => {
+                            match String::from_utf8(bytes.to_vec()) {
+                                Ok(text) => {
+                                    // Intentar formatear como JSON si es posible
+                                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+                                        serde_json::to_string_pretty(&json).unwrap_or(text)
+                                    } else {
+                                        text
+                                    }
+                                },
+                                Err(e) => format!("Error al convertir bytes a texto: {}", e)
+                            }
+                        }
+                        Err(e) => format!("Error al obtener el cuerpo de la respuesta: {}", e),
+                    }
+                });
+
+                // Imprimir información de diagnóstico
+                println!("Status Code: {}", self.status_code);
+                println!("Response length: {} bytes", response_text.len());
+                
+                // Guardar la respuesta completa
+                self.response = Some(response_text);
             }
             Err(err) => {
                 self.status_code = "Error".to_string();
-                self.response = Some(format!("Error: {}", err));
+                self.response = Some(format!("Error en la solicitud: {}", err));
             }
         }
     }
@@ -222,17 +261,53 @@ impl TabViewer for Mensajero {
             }
             Tab::Body => {
                 ui.heading("Body");
-                if self.method == "POST" || self.method == "PUT" {
+            
+                ui.vertical(|ui| {
+                    let available_height = ui.available_height();
+                    let request_height = (available_height * 0.5).max(250.0); // 50% del espacio disponible
+                    let response_height = (available_height * 0.5).max(500.0); // 100% del espacio disponible
+                    
+                    ui.label("JSON Request:");
                     if self.request_body.is_none() {
                         self.request_body = Some(String::new());
                     }
-                    if let Some(body) = &mut self.request_body {
-                        ui.text_edit_multiline(body);
+                    if let Some(request) = &mut self.request_body {
+                        egui::ScrollArea::vertical()
+                            .id_salt("request_scroll") // ID único para el scroll del request
+                            .max_height(request_height)
+                            .show(ui, |ui| {
+                                ui.push_id("request_edit", |ui| { // ID único para el TextEdit del request
+                                    ui.add(
+                                        egui::TextEdit::multiline(request)
+                                            .hint_text("Escribe tu solicitud en formato JSON aquí")
+                                            .desired_width(ui.available_width())
+                                            .desired_rows(28)
+
+                                    )
+                                });
+                            });
                     }
-                } else {
-                    ui.label("Body disponible solo para métodos POST o PUT");
-                }
-            }
+                    ui.add_space(20.0); // Añade 20 píxeles de espacio vertical
+                    ui.separator();
+                    ui.add_space(20.0);
+                    if let Some(response) = &self.response {
+                        egui::ScrollArea::vertical()
+                            .id_salt("response_scroll") // ID único para el scroll del response
+                            .max_height(response_height)
+                            .show(ui, |ui| {
+                                ui.push_id("response_edit", |ui| { // ID único para el TextEdit del response
+                                    ui.add(
+                                        egui::TextEdit::multiline(&mut response.clone())
+                                            .desired_width(ui.available_width())
+                                            .desired_rows(28)
+                                            .font(egui::TextStyle::Monospace)
+                                            .interactive(true)
+                                    )
+                                });
+                            });
+                    } 
+                });
+            },
             Tab::Authorization => {
                 ui.heading("Authentication");
                 ui.horizontal(|ui| {
@@ -260,7 +335,66 @@ impl TabViewer for Mensajero {
 
 impl eframe::App for Mensajero {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+        {
+            let mut style = (*ctx.style()).clone();
+            
+            // Paleta base
+            let window_fill = egui::Color32::from_rgb(255, 255, 255);    // Blanco puro
+            let panel_fill = egui::Color32::from_rgb(250, 250, 250);     // Gris casi blanco
+            let text_color = egui::Color32::from_rgb(51, 51, 51);        // Gris oscuro
+            let hover_color = egui::Color32::from_rgb(245, 245, 245);    // Gris muy claro
+            let border_color = egui::Color32::from_rgb(230, 230, 230);   // Gris claro para bordes
+            
+            // Colores para botones
+            let button_color = egui::Color32::from_rgb(255, 149, 0);     // Naranja principal
+            let button_hover = egui::Color32::from_rgb(255, 165, 41);    // Naranja más claro para hover
+            let button_active = egui::Color32::from_rgb(230, 134, 0);    // Naranja más oscuro para click
+
+            // Configuración general
+            style.visuals.window_fill = window_fill;
+            style.visuals.panel_fill = panel_fill;
+            style.visuals.extreme_bg_color = panel_fill;
+            
+            // Widgets normales (no botones)
+            style.visuals.widgets.noninteractive.bg_fill = window_fill;
+            style.visuals.widgets.noninteractive.fg_stroke.color = text_color;
+            style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, border_color);
+            
+            // Botones
+            style.visuals.widgets.inactive.bg_fill = button_color;
+            style.visuals.widgets.inactive.fg_stroke.color = egui::Color32::BLACK; // Texto blanco en botones
+            style.visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+            
+            // Hover de botones
+            style.visuals.widgets.hovered.bg_fill = button_hover;
+            style.visuals.widgets.hovered.fg_stroke.color = egui::Color32::BLACK;
+            style.visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
+            
+            // Click en botones
+            style.visuals.widgets.active.bg_fill = button_active;
+            style.visuals.widgets.active.fg_stroke.color = egui::Color32::BLACK;
+            style.visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
+            
+            // Bordes redondeados
+            style.visuals.widgets.noninteractive.rounding = 4.0.into();
+            style.visuals.widgets.inactive.rounding = 4.0.into();
+            style.visuals.widgets.hovered.rounding = 4.0.into();
+            style.visuals.widgets.active.rounding = 4.0.into();
+            
+            // Selección
+            style.visuals.selection.bg_fill = button_color.linear_multiply(0.2);
+            
+            // Espaciado
+            style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+            style.spacing.window_margin = egui::Margin::same(16.0);
+            style.spacing.button_padding = egui::vec2(12.0, 8.0);
+
+            ctx.set_style(style);
+        }
+        egui::CentralPanel::default()
+        .frame(egui::Frame::none().inner_margin(10.0))
+        .show(ctx, |ui| {
+
             // Coloca todos los elementos dentro de una columna
             ui.vertical(|ui| {
                 // URL input
@@ -283,7 +417,6 @@ impl eframe::App for Mensajero {
                     egui::TextEdit::singleline(&mut self.url)
                         .hint_text("URL:")
                         .desired_width(available_width)
-                        //.font(egui::TextStyle::Monospace)
                         .min_size(egui::vec2(100.0, 35.0))
                         .font(egui::TextStyle::Heading)
                         .text_color(egui::Color32::from_rgb(255, 255, 0))
@@ -297,17 +430,23 @@ impl eframe::App for Mensajero {
                         .clicked()
                     {
                         self.send_request();
+                        if let Some(body) = &self.request_body {
+                            println!("Request: {}", body);
+                        }
                     }
                 });
 
                 ui.separator();
-
-                // coloca los tabs debajo del formulario
-                DockArea::new(&mut self.dock_state.clone()).show_inside(ui, self);
+                // Clone the dock_state instead of moving it
+                let mut dock_state = self.dock_state.clone();
+                DockArea::new(&mut dock_state).show_inside(ui, self);
+                // Update the original dock_state with the modified one
+                self.dock_state = dock_state;
             });
         });
     }
 }
+
 
 fn main() {
     let options = eframe::NativeOptions {
